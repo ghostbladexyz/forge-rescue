@@ -74,3 +74,26 @@ func TestHasRefsTreatsEmptyRepositoryAsNoRefs(t *testing.T) {
 		t.Fatalf("hasRefs = true, want false")
 	}
 }
+
+func TestDeleteRepositoryDeletesOwnerRepo(t *testing.T) {
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if r.Method != http.MethodDelete {
+			t.Fatalf("method = %q, want DELETE", r.Method)
+		}
+		if r.Header.Get("Authorization") != "Bearer token" {
+			t.Fatalf("Authorization = %q, want Bearer token", r.Header.Get("Authorization"))
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := NewClientWithBaseURL(server.URL, "token")
+	if err := client.DeleteRepository(context.Background(), "ghostbladexyz", "alice-project"); err != nil {
+		t.Fatalf("DeleteRepository returned error: %v", err)
+	}
+	if gotPath != "/repos/ghostbladexyz/alice-project" {
+		t.Fatalf("path = %q, want /repos/ghostbladexyz/alice-project", gotPath)
+	}
+}

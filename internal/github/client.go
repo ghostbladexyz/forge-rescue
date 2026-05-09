@@ -88,6 +88,19 @@ func (c *Client) HasRefs(ctx context.Context, owner, name string) (bool, error) 
 	return len(refs) > 0, nil
 }
 
+func (c *Client) DeleteRepository(ctx context.Context, owner, name string) error {
+	resp, err := c.do(ctx, http.MethodDelete, "/repos/"+url.PathEscape(owner)+"/"+url.PathEscape(name), nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return fmt.Errorf("delete GitHub repository %s/%s returned %s", owner, name, resp.Status)
+	}
+	return nil
+}
+
 func (c *Client) do(ctx context.Context, method, path string, value any) (*http.Response, error) {
 	var body *bytes.Reader
 	if value == nil {

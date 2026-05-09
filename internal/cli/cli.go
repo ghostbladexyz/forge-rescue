@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/ghostbladexyz/forge-rescue/internal/gitea"
@@ -21,7 +22,12 @@ type Env struct {
 	Now              func() time.Time
 	CommandRunner    rescue.CommandRunner
 	MetadataExporter rescue.MetadataExporter
-	GitHubClient     upload.GitHubClient
+	GitHubClient     gitHubClient
+}
+
+type gitHubClient interface {
+	upload.GitHubClient
+	DeleteRepository(ctx context.Context, owner, name string) error
 }
 
 func Run(ctx context.Context, args []string, env Env, out io.Writer) error {
@@ -42,6 +48,8 @@ func Run(ctx context.Context, args []string, env Env, out io.Writer) error {
 		return runRescue(ctx, args[1:], env, out)
 	case "upload":
 		return runUpload(ctx, args[1:], env, out)
+	case "delete":
+		return runDelete(ctx, args[1:], env, out)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -166,6 +174,58 @@ func runUpload(ctx context.Context, args []string, env Env, out io.Writer) error
 	return nil
 }
 
+func runDelete(ctx context.Context, args []string, env Env, out io.Writer) error {
+	if len(args) == 0 {
+		return fmt.Errorf("delete requires a provider")
+	}
+	if args[0] != "github" {
+		return fmt.Errorf("unsupported delete provider %q", args[0])
+	}
+
+	fs := flag.NewFlagSet("delete github", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	owner := fs.String("owner", "", "GitHub user or organization that owns repositories")
+	deleteRepo := fs.Bool("delete-repo", false, "delete the named GitHub repositories")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if *owner == "" {
+		return fmt.Errorf("delete github requires --owner")
+	}
+	if !*deleteRepo {
+		return fmt.Errorf("delete github requires --delete-repo")
+	}
+	names := fs.Args()
+	if len(names) == 0 {
+		return fmt.Errorf("delete github requires at least one repository name")
+	}
+	if env.GitHubToken == "" {
+		env.GitHubToken = os.Getenv("GITHUB_TOKEN")
+	}
+	if env.GitHubToken == "" {
+		return fmt.Errorf("set GITHUB_TOKEN or provide a GitHub token in the environment")
+	}
+
+	client := env.GitHubClient
+	if client == nil {
+		client = github.NewClient(env.GitHubToken)
+	}
+
+	var failures []string
+	for _, name := range names {
+		repoName := rescue.SafeName(name)
+		if err := client.DeleteRepository(ctx, *owner, repoName); err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", repoName, err))
+			continue
+		}
+		fmt.Fprintf(out, "Deleted %s/%s\n", *owner, repoName)
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("deleted %d repos with %d failures: %s", len(names)-len(failures), len(failures), strings.Join(failures, "; "))
+	}
+	return nil
+}
+
 func printRiskSummary(out io.Writer, repos []rescue.Repo, now time.Time) {
 	cfg := rescue.DefaultRiskConfig()
 	groups := []struct {
@@ -190,6 +250,6 @@ func printRiskSummary(out io.Writer, repos []rescue.Repo, now time.Time) {
 }
 
 func usage(out io.Writer) error {
-	fmt.Fprintln(out, "usage: forge-rescue scan --instance URL | forge-rescue rescue [--high-risk|--medium-risk] [owner/repo...] | forge-rescue upload github --owner OWNER")
+	fmt.Fprintln(out, "usage: forge-rescue scan --instance URL | forge-rescue rescue [--high-risk|--medium-risk] [owner/repo...] | forge-rescue upload github --owner OWNER | forge-rescue delete github --owner OWNER --delete-repo repo...")
 	return nil
 }

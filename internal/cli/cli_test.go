@@ -159,6 +159,28 @@ func TestUploadGitHubCommandUsesGitHubTokenAndOwner(t *testing.T) {
 	}
 }
 
+func TestDeleteGitHubCommandDeletesMultipleRepositories(t *testing.T) {
+	gh := &recordingGitHub{}
+	var out bytes.Buffer
+	err := Run(context.Background(), []string{"delete", "github", "--owner", "ghostbladexyz", "--delete-repo", "alice/project", "bob-tool"}, Env{
+		GitHubToken:  "gh-token",
+		GitHubClient: gh,
+	}, &out)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	want := []string{"ghostbladexyz/alice-project", "ghostbladexyz/bob-tool"}
+	if len(gh.deleted) != len(want) {
+		t.Fatalf("deleted repos = %#v, want %#v", gh.deleted, want)
+	}
+	for i := range want {
+		if gh.deleted[i] != want[i] {
+			t.Fatalf("deleted repos = %#v, want %#v", gh.deleted, want)
+		}
+	}
+}
+
 func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")
@@ -180,7 +202,8 @@ func (recordingExporter) ExportMetadata(ctx context.Context, repo rescue.Repo, m
 }
 
 type recordingGitHub struct {
-	repos map[string]bool
+	repos   map[string]bool
+	deleted []string
 }
 
 func (g *recordingGitHub) RepositoryExists(ctx context.Context, owner, name string) (bool, error) {
@@ -200,4 +223,9 @@ func (g *recordingGitHub) CreateRepository(ctx context.Context, owner, name stri
 
 func (g *recordingGitHub) HasRefs(ctx context.Context, owner, name string) (bool, error) {
 	return false, nil
+}
+
+func (g *recordingGitHub) DeleteRepository(ctx context.Context, owner, name string) error {
+	g.deleted = append(g.deleted, owner+"/"+name)
+	return nil
 }
