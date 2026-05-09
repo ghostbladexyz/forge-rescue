@@ -10,14 +10,18 @@ import (
 	"time"
 
 	"github.com/ghostbladexyz/forge-rescue/internal/gitea"
+	"github.com/ghostbladexyz/forge-rescue/internal/github"
 	"github.com/ghostbladexyz/forge-rescue/internal/rescue"
+	"github.com/ghostbladexyz/forge-rescue/internal/upload"
 )
 
 type Env struct {
 	Token            string
+	GitHubToken      string
 	Now              func() time.Time
 	CommandRunner    rescue.CommandRunner
 	MetadataExporter rescue.MetadataExporter
+	GitHubClient     upload.GitHubClient
 }
 
 func Run(ctx context.Context, args []string, env Env, out io.Writer) error {
@@ -36,6 +40,8 @@ func Run(ctx context.Context, args []string, env Env, out io.Writer) error {
 		return runScan(ctx, args[1:], env, out)
 	case "rescue":
 		return runRescue(ctx, args[1:], env, out)
+	case "upload":
+		return runUpload(ctx, args[1:], env, out)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -120,6 +126,46 @@ func runRescue(ctx context.Context, args []string, env Env, out io.Writer) error
 	return nil
 }
 
+func runUpload(ctx context.Context, args []string, env Env, out io.Writer) error {
+	if len(args) == 0 {
+		return fmt.Errorf("upload requires a provider")
+	}
+	if args[0] != "github" {
+		return fmt.Errorf("unsupported upload provider %q", args[0])
+	}
+
+	fs := flag.NewFlagSet("upload github", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	owner := fs.String("owner", "", "GitHub user or organization that will receive repositories")
+	dataDir := fs.String("data-dir", "forge-rescue-data", "output directory")
+	forceExisting := fs.Bool("force-existing", false, "push into existing non-empty GitHub repositories")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if env.GitHubToken == "" {
+		env.GitHubToken = os.Getenv("GITHUB_TOKEN")
+	}
+
+	client := env.GitHubClient
+	if client == nil {
+		client = github.NewClient(env.GitHubToken)
+	}
+	err := upload.Run(ctx, upload.Options{
+		DataDir:       *dataDir,
+		Owner:         *owner,
+		Token:         env.GitHubToken,
+		ForceExisting: *forceExisting,
+		GitHub:        client,
+		CommandRunner: env.CommandRunner,
+		Now:           env.Now,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(out, "GitHub upload complete")
+	return nil
+}
+
 func printRiskSummary(out io.Writer, repos []rescue.Repo, now time.Time) {
 	cfg := rescue.DefaultRiskConfig()
 	groups := []struct {
@@ -144,6 +190,6 @@ func printRiskSummary(out io.Writer, repos []rescue.Repo, now time.Time) {
 }
 
 func usage(out io.Writer) error {
-	fmt.Fprintln(out, "usage: forge-rescue scan --instance URL | forge-rescue rescue [--high-risk|--medium-risk] [owner/repo...]")
+	fmt.Fprintln(out, "usage: forge-rescue scan --instance URL | forge-rescue rescue [--high-risk|--medium-risk] [owner/repo...] | forge-rescue upload github --owner OWNER")
 	return nil
 }

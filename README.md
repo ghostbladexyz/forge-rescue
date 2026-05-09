@@ -6,8 +6,9 @@ It does two things:
 
 - `scan` lists accessible user and organization repositories and classifies age-based deletion risk.
 - `rescue` mirror-clones selected repositories and exports raw Gitea metadata.
+- `upload github` bulk-creates private GitHub repositories and pushes rescued mirrors.
 
-It does not migrate issues, recreate pull requests, upload to another forge, or synchronize repositories.
+It does not migrate issues, recreate pull requests, or synchronize repositories.
 
 ## Install
 
@@ -76,6 +77,13 @@ Bash, from this checkout:
 ./forge-rescue scan --instance https://platform.zone01.gr/git
 ```
 
+This writes:
+
+```text
+forge-rescue-data/
+  scan.json
+```
+
 Rescue high-risk repositories from the last scan:
 
 PowerShell:
@@ -118,6 +126,37 @@ Bash:
 ./forge-rescue rescue owner/repo another-owner/another-repo
 ```
 
+Upload rescued mirrors to GitHub:
+
+PowerShell:
+
+```powershell
+$env:GITHUB_TOKEN = "your-github-token"
+.\forge-rescue.exe upload github --owner your-github-username
+```
+
+Bash:
+
+```bash
+export GITHUB_TOKEN="your-github-token"
+./forge-rescue upload github --owner your-github-username
+```
+
+To create the GitHub token:
+
+1. Open GitHub in the browser.
+2. Go to `Settings`.
+3. Open `Developer settings`.
+4. Open `Personal access tokens`.
+5. Open `Tokens (classic)`.
+6. Create a new classic token.
+7. Select the `repo` scope.
+8. Copy the token immediately and set it as `GITHUB_TOKEN`.
+
+Delete this GitHub token after you finish rescuing and uploading repositories. A classic token with `repo` can create and modify repositories in your account.
+
+GitHub repositories are created as private by default. A rescued Gitea repository named `owner/repo` is uploaded to a GitHub repository named `owner-repo`.
+
 Output is written to:
 
 ```text
@@ -131,7 +170,7 @@ forge-rescue-data/
       releases.json
       labels.json
   manifest.json
-  scan.json
+  upload-github.json
 ```
 
 ## Risk Rules
@@ -147,3 +186,5 @@ An active repository can still be high risk if it was created more than a year a
 ## Notes
 
 `rescue` shells out to the real `git` binary and runs `git clone --mirror`. For private repositories, your local Git credential setup must be able to clone from the Gitea instance.
+
+`upload github` shells out to `git push --mirror`. If a GitHub repository already exists and has refs, it is skipped by default to avoid overwriting or deleting existing branches and tags. Use `--force-existing` only when you intentionally want the local mirror to replace the GitHub refs.

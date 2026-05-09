@@ -124,6 +124,41 @@ func TestRescueCommandSelectsMediumRisk(t *testing.T) {
 	}
 }
 
+func TestUploadGitHubCommandUsesGitHubTokenAndOwner(t *testing.T) {
+	tmp := t.TempDir()
+	scan := rescue.Scan{
+		Repos: []rescue.Repo{{FullName: "alice/project", CloneURL: "https://git.example/alice/project.git"}},
+	}
+	if err := rescue.WriteScan(filepath.Join(tmp, "scan.json"), scan); err != nil {
+		t.Fatalf("WriteScan returned error: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(tmp, "repos", "alice-project.git"), 0o755); err != nil {
+		t.Fatalf("creating mirror dir: %v", err)
+	}
+
+	var out bytes.Buffer
+	err := Run(context.Background(), []string{"upload", "github", "--owner", "ghostbladexyz", "--data-dir", tmp}, Env{
+		GitHubToken:      "gh-token",
+		GitHubClient:     &recordingGitHub{},
+		CommandRunner:    &recordingRunner{},
+		MetadataExporter: &recordingExporter{},
+		Now: func() time.Time {
+			return time.Date(2026, 5, 9, 0, 0, 0, 0, time.UTC)
+		},
+	}, &out)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	report, err := os.ReadFile(filepath.Join(tmp, "upload-github.json"))
+	if err != nil {
+		t.Fatalf("reading report: %v", err)
+	}
+	if !bytes.Contains(report, []byte(`"success": 1`)) {
+		t.Fatalf("report = %s, want success 1", report)
+	}
+}
+
 func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")
@@ -142,4 +177,27 @@ type recordingExporter struct{}
 
 func (recordingExporter) ExportMetadata(ctx context.Context, repo rescue.Repo, metadataDir string) error {
 	return nil
+}
+
+type recordingGitHub struct {
+	repos map[string]bool
+}
+
+func (g *recordingGitHub) RepositoryExists(ctx context.Context, owner, name string) (bool, error) {
+	return g.repos[owner+"/"+name], nil
+}
+
+func (g *recordingGitHub) CreateRepository(ctx context.Context, owner, name string, private bool) error {
+	if !private {
+		return nil
+	}
+	if g.repos == nil {
+		g.repos = map[string]bool{}
+	}
+	g.repos[owner+"/"+name] = true
+	return nil
+}
+
+func (g *recordingGitHub) HasRefs(ctx context.Context, owner, name string) (bool, error) {
+	return false, nil
 }
