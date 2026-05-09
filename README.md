@@ -1,39 +1,48 @@
 # forge-rescue
 
-`forge-rescue` is a small CLI for evacuating repositories from a Gitea instance before age-based deletion.
+`forge-rescue` is a small CLI for evacuating repositories from a Gitea instance before *age-based deletion*.
 
-It does two things:
+**It does four things:**
 
 - `scan` lists accessible user and organization repositories and classifies age-based deletion risk.
 - `rescue` mirror-clones selected repositories and exports raw Gitea metadata.
 - `upload github` bulk-creates private GitHub repositories and pushes rescued mirrors.
 - `delete github` deletes explicitly named GitHub repositories.
 
-It does not migrate issues, recreate pull requests, or synchronize repositories.
+**Out of scope:** it does not migrate issues, recreate pull requests, or synchronize repositories.
+
+## Requirements
+
+- Go 1.22 or newer.
+- Git installed and available in your shell `PATH`.
+- A Gitea personal access token for scanning and rescuing.
+- A GitHub classic token for uploading or deleting GitHub repositories.
 
 ## Install
 
-PowerShell:
+### From Go
+
+**PowerShell**
 
 ```powershell
 go install github.com/ghostbladexyz/forge-rescue@latest
 ```
 
-Bash:
+**Bash**
 
 ```bash
 go install github.com/ghostbladexyz/forge-rescue@latest
 ```
 
-From this checkout:
+### From This Checkout
 
-PowerShell:
+**PowerShell**
 
 ```powershell
 go build .
 ```
 
-Bash:
+**Bash**
 
 ```bash
 go build .
@@ -41,21 +50,23 @@ go build .
 
 ## Usage
 
+### Gitea Token
+
 Create a Gitea personal access token with repository read access, then expose it for the current shell:
 
-PowerShell:
+**PowerShell**
 
 ```powershell
 $env:FORGE_RESCUE_TOKEN = "your-token"
 ```
 
-Bash:
+**Bash**
 
 ```bash
 export FORGE_RESCUE_TOKEN="your-token"
 ```
 
-To create the Gitea token:
+**To create the Gitea token:**
 
 1. Open your Gitea instance in the browser.
 2. Go to your profile menu, then `Settings`.
@@ -64,28 +75,32 @@ To create the Gitea token:
 5. Give it read access to repositories, users, and organizations.
 6. Copy the token immediately and set it as `FORGE_RESCUE_TOKEN`.
 
-Scan an instance:
+### Scan
 
-PowerShell, from this checkout:
+**PowerShell, from this checkout**
 
 ```powershell
 .\forge-rescue.exe scan --instance https://platform.zone01.gr/git
 ```
 
-Bash, from this checkout:
+**Bash, from this checkout**
 
 ```bash
 ./forge-rescue scan --instance https://platform.zone01.gr/git
 ```
 
-This writes:
+This writes `scan.json`:
 
 ```text
 forge-rescue-data/
   scan.json
 ```
 
-Rescue high-risk repositories from the last scan:
+### Rescue
+
+**High-risk repositories**
+
+PowerShell:
 
 PowerShell:
 
@@ -99,7 +114,9 @@ Bash:
 ./forge-rescue rescue --high-risk
 ```
 
-Rescue medium-risk repositories from the last scan:
+**Medium-risk repositories**
+
+PowerShell:
 
 PowerShell:
 
@@ -113,7 +130,9 @@ Bash:
 ./forge-rescue rescue --medium-risk
 ```
 
-Rescue specific repositories:
+**Specific repositories**
+
+PowerShell:
 
 PowerShell:
 
@@ -127,23 +146,23 @@ Bash:
 ./forge-rescue rescue owner/repo another-owner/another-repo
 ```
 
-Upload rescued mirrors to GitHub:
+### GitHub Upload
 
-PowerShell:
+**PowerShell**
 
 ```powershell
 $env:GITHUB_TOKEN = "your-github-token"
 .\forge-rescue.exe upload github --owner your-github-username
 ```
 
-Bash:
+**Bash**
 
 ```bash
 export GITHUB_TOKEN="your-github-token"
 ./forge-rescue upload github --owner your-github-username
 ```
 
-To create the GitHub token:
+**To create the GitHub token:**
 
 1. Open GitHub in the browser.
 2. Go to `Settings`.
@@ -156,11 +175,15 @@ To create the GitHub token:
    - `delete_repo`
 8. Copy the token immediately and set it as `GITHUB_TOKEN`.
 
-Delete this GitHub token after you finish rescuing, uploading, and deleting repositories. A classic token with `repo` and `delete_repo` can create, modify, and delete repositories in your account.
+**Delete this GitHub token after you finish** rescuing, uploading, and deleting repositories. A classic token with `repo` and `delete_repo` can create, modify, and delete repositories in your account.
 
 GitHub repositories are created as private by default. A rescued Gitea repository named `owner/repo` is uploaded to a GitHub repository named `owner-repo`.
 
-Delete GitHub repositories by explicit name:
+### GitHub Delete
+
+**Warning:** deletion is permanent from GitHub's side. Make sure the repositories exist locally in `forge-rescue-data/repos/` or somewhere else before deleting anything.
+
+**Delete by GitHub repository name**
 
 PowerShell:
 
@@ -174,7 +197,9 @@ Bash:
 ./forge-rescue delete github --owner your-github-username --delete-repo owner-repo another-owner-another-repo
 ```
 
-You can also pass original Gitea-style names. They are mapped the same way as upload:
+**Delete by original Gitea-style name**
+
+You can also pass original Gitea-style names. They are mapped the same way as upload.
 
 PowerShell:
 
@@ -188,14 +213,14 @@ Bash:
 ./forge-rescue delete github --owner your-github-username --delete-repo owner/repo another-owner/another-repo
 ```
 
-Example:
+**Mapping example**
 
 ```text
 Gitea repo:  lpapanthy/go-reloaded
 GitHub repo: lpapanthy-go-reloaded
 ```
 
-These two commands delete the same GitHub repository:
+These two commands delete the same GitHub repository.
 
 PowerShell:
 
@@ -227,7 +252,7 @@ For deleting GitHub repositories, use a token that can delete repositories:
 
 - Classic token: `delete_repo` scope.
 
-Output is written to:
+### Output
 
 ```text
 forge-rescue-data/
@@ -245,18 +270,29 @@ forge-rescue-data/
 
 ## Risk Rules
 
-Default repository age thresholds:
+**Default repository age thresholds:**
 
 - `HIGH`: created more than 365 days ago
 - `MEDIUM`: created more than 180 days ago
 - `SAFE`: anything newer
 
-An active repository can still be high risk if it was created more than a year ago. If a repository has no creation timestamp in the API response, `updated_at` is used as a fallback.
+An active repository can still be **high risk** if it was created more than a year ago. If a repository has no creation timestamp in the API response, `updated_at` is used as a fallback.
 
 ## Notes
 
-`rescue` shells out to the real `git` binary and runs `git clone --mirror`. For private repositories, your local Git credential setup must be able to clone from the Gitea instance.
+**`rescue`:** shells out to the real `git` binary and runs `git clone --mirror`. For private repositories, your local Git credential setup must be able to clone from the Gitea instance.
 
-`upload github` shells out to `git push --mirror`. If a GitHub repository already exists and has refs, it is skipped by default to avoid overwriting or deleting existing branches and tags. Use `--force-existing` only when you intentionally want the local mirror to replace the GitHub refs.
+**`upload github`:** shells out to `git push --mirror`. If a GitHub repository already exists and has refs, it is skipped by default to avoid overwriting or deleting existing branches and tags. Use `--force-existing` only when you intentionally want the local mirror to replace the GitHub refs.
 
-`delete github --delete-repo` permanently deletes the named GitHub repositories from the selected `--owner`. Only pass names you have already verified.
+**`delete github --delete-repo`:** permanently deletes the named GitHub repositories from the selected `--owner`. Only pass names you have already verified.
+
+## Common Errors
+
+**`forge-rescue` is not recognized:**
+Use `.\forge-rescue.exe` in PowerShell or `./forge-rescue` in Bash when running from this checkout.
+
+**`403 Forbidden` from GitHub:**
+Your token is missing the required `repo` or `delete_repo` scope, or `--owner` does not match the GitHub account that owns the token.
+
+**`local mirror missing` during upload:**
+Run `rescue` before `upload`. Upload only pushes repositories that exist in `forge-rescue-data/repos/`.
