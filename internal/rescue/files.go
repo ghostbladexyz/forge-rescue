@@ -19,8 +19,15 @@ func WriteScan(path string, scan Scan) error {
 	return workspace.SaveScan(scan)
 }
 
-// ReadScan reads a scan record while preserving the original path-based compatibility interface.
+// ReadScan routes canonical workspace scans through OpenWorkspace so interrupted metadata swaps recover before the read.
 func ReadScan(path string) (Scan, error) {
+	if filepath.Base(path) == "scan.json" {
+		workspace, err := OpenWorkspace(filepath.Dir(path))
+		if err != nil {
+			return Scan{}, err
+		}
+		return workspace.LoadScan()
+	}
 	var scan Scan
 	err := readJSON(path, &scan)
 	return scan, err
@@ -31,8 +38,15 @@ func WriteManifest(path string, manifest Manifest) error {
 	return writeJSONAtomic(path, manifest)
 }
 
-// ReadManifest reads a manifest record from its compatibility path.
+// ReadManifest routes canonical workspace manifests through OpenWorkspace so interrupted metadata swaps recover before the read.
 func ReadManifest(path string) (Manifest, error) {
+	if filepath.Base(path) == "manifest.json" {
+		workspace, err := OpenWorkspace(filepath.Dir(path))
+		if err != nil {
+			return Manifest{}, err
+		}
+		return workspace.LoadManifest()
+	}
 	var manifest Manifest
 	err := readJSON(path, &manifest)
 	return manifest, err

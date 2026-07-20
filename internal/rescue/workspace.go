@@ -36,10 +36,11 @@ type workspaceRepository struct {
 
 // Workspace owns the durable layout and repository identity mapping for one source forge.
 type Workspace struct {
-	root    string
-	index   workspaceIndex
-	indexed bool
-	legacy  bool
+	root                 string
+	index                workspaceIndex
+	indexed              bool
+	legacy               bool
+	removeMetadataBackup func(string) error // Cleanup is injected so tests can prove it does not change an installed capture's outcome.
 }
 
 // Artifact identifies workspace-owned storage without deriving paths from display or destination names.
@@ -71,13 +72,13 @@ func (w *Workspace) ArtifactFor(repo Repo) (Artifact, error) {
 	return w.artifact(repo)
 }
 
-// OpenWorkspace opens an existing rescue workspace or prepares an empty handle without mutating the filesystem.
+// OpenWorkspace opens a rescue workspace and repairs any metadata swap interrupted after its first durable rename.
 func OpenWorkspace(root string) (*Workspace, error) {
 	if root == "" {
 		root = "forge-rescue-data"
 	}
 
-	w := &Workspace{root: filepath.Clean(root)}
+	w := &Workspace{root: filepath.Clean(root), removeMetadataBackup: os.RemoveAll}
 	indexPath := filepath.Join(w.root, "workspace.json")
 	if err := readJSON(indexPath, &w.index); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -90,6 +91,9 @@ func OpenWorkspace(root string) (*Workspace, error) {
 		return nil, fmt.Errorf("validate workspace index: %w", err)
 	}
 	w.indexed = true
+	if err := w.recoverMetadataSwaps(); err != nil {
+		return nil, err
+	}
 	return w, nil
 }
 
@@ -118,9 +122,14 @@ func (w *Workspace) SaveScan(scan Scan) error {
 	return nil
 }
 
-// LoadScan reads the workspace scan while keeping legacy scan files compatible.
+// LoadScan recovers indexed metadata transactions before reading the workspace scan, while keeping legacy scans compatible.
 func (w *Workspace) LoadScan() (Scan, error) {
 	var scan Scan
+	if w.indexed {
+		if err := w.recoverMetadataSwaps(); err != nil {
+			return scan, err
+		}
+	}
 	if err := readJSON(filepath.Join(w.root, "scan.json"), &scan); err != nil {
 		return scan, err
 	}
@@ -138,9 +147,14 @@ func (w *Workspace) SaveManifest(manifest Manifest) error {
 	return writeJSONAtomic(filepath.Join(w.root, "manifest.json"), manifest)
 }
 
-// LoadManifest reads the latest rescue run from either a versioned or legacy workspace.
+// LoadManifest recovers indexed metadata transactions before reading the latest rescue run.
 func (w *Workspace) LoadManifest() (Manifest, error) {
 	var manifest Manifest
+	if w.indexed {
+		if err := w.recoverMetadataSwaps(); err != nil {
+			return manifest, err
+		}
+	}
 	err := readJSON(filepath.Join(w.root, "manifest.json"), &manifest)
 	return manifest, err
 }
@@ -162,6 +176,9 @@ func (w *Workspace) SaveMetadata(repo Repo, metadata RepositoryMetadata) error {
 		return err
 	}
 	if err := w.ensurePrivateDirectories(); err != nil {
+		return err
+	}
+	if err := w.recoverMetadataSwap(repo.FullName, artifact.Identity, artifact.MetadataPath); err != nil {
 		return err
 	}
 
@@ -190,17 +207,18 @@ func (w *Workspace) SaveMetadata(repo Repo, metadata RepositoryMetadata) error {
 		}
 	}
 
-	backup := artifact.MetadataPath + ".previous"
-	if directoryExists(backup) && !directoryExists(artifact.MetadataPath) {
-		// A prior process may have stopped between the two renames, so restore its complete capture before trying again.
-		if err := os.Rename(backup, artifact.MetadataPath); err != nil {
-			return fmt.Errorf("restore previous metadata for %s: %w", repo.FullName, err)
+	backup := w.metadataBackupPath(artifact.Identity)
+	if pathExists(backup) {
+		// A retained backup is harmless to the installed capture, but a new swap needs the exact backup path free.
+		if err := w.removeBackup(backup); err != nil {
+			return fmt.Errorf("prepare metadata replacement for %s: %w", repo.FullName, err)
 		}
-	} else if err := os.RemoveAll(backup); err != nil {
-		return fmt.Errorf("clear stale metadata backup for %s: %w", repo.FullName, err)
 	}
 	hadPrevious := directoryExists(artifact.MetadataPath)
 	if hadPrevious {
+		if err := os.MkdirAll(filepath.Dir(backup), 0o700); err != nil {
+			return fmt.Errorf("prepare metadata transaction for %s: %w", repo.FullName, err)
+		}
 		// The previous directory moves aside only after staging succeeds, so capture failures never damage the last complete archive.
 		if err := os.Rename(artifact.MetadataPath, backup); err != nil {
 			return fmt.Errorf("preserve previous metadata for %s: %w", repo.FullName, err)
@@ -213,11 +231,64 @@ func (w *Workspace) SaveMetadata(repo Repo, metadata RepositoryMetadata) error {
 		return fmt.Errorf("install metadata for %s: %w", repo.FullName, err)
 	}
 	if hadPrevious {
-		if err := os.RemoveAll(backup); err != nil {
-			return fmt.Errorf("remove previous metadata for %s: %w", repo.FullName, err)
+		// The canonical path now contains the complete new capture, so backup cleanup cannot invalidate the transaction.
+		_ = w.removeBackup(backup)
+	}
+	return nil
+}
+
+// recoverMetadataSwaps repairs exact indexed metadata paths so opening a workspace always exposes a complete capture at its canonical path.
+func (w *Workspace) recoverMetadataSwaps() error {
+	for _, entry := range w.index.Repositories {
+		metadataPath := w.artifactFromEntry(entry).MetadataPath
+		if err := w.recoverMetadataSwap(entry.FullName, entry.Identity, metadataPath); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// recoverMetadataSwap restores a preserved capture after the first rename or discards it after the second rename completed.
+func (w *Workspace) recoverMetadataSwap(fullName, identity, metadataPath string) error {
+	backup := w.metadataBackupPath(identity)
+	backupInfo, err := os.Lstat(backup)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect previous metadata for %s: %w", fullName, err)
+	}
+	_, currentErr := os.Lstat(metadataPath)
+	if currentErr == nil {
+		// Both paths mean the staged capture reached its canonical name, so the older capture is only cleanup residue.
+		_ = w.removeBackup(backup)
+		return nil
+	}
+	if !errors.Is(currentErr, os.ErrNotExist) {
+		return fmt.Errorf("inspect metadata for %s: %w", fullName, currentErr)
+	}
+	if !backupInfo.IsDir() {
+		return fmt.Errorf("previous metadata for %s is not a directory", fullName)
+	}
+	// Only the backup means interruption occurred between renames, so restoring it re-establishes the last complete capture.
+	if err := os.Rename(backup, metadataPath); err != nil {
+		return fmt.Errorf("restore previous metadata for %s: %w", fullName, err)
+	}
+	return nil
+}
+
+// removeBackup invokes the workspace's filesystem adapter so cleanup failure can be tested independently from capture installation.
+func (w *Workspace) removeBackup(path string) error {
+	if w.removeMetadataBackup == nil {
+		return os.RemoveAll(path)
+	}
+	return w.removeMetadataBackup(path)
+}
+
+// metadataBackupPath hashes the validated source identity into a reserved namespace outside canonical metadata directories.
+func (w *Workspace) metadataBackupPath(identity string) string {
+	digest := sha256.Sum256([]byte(identity))
+	return filepath.Join(w.root, ".metadata-backups", hex.EncodeToString(digest[:]))
 }
 
 // WriteReport atomically stores a named JSON report at the workspace root for downstream workflows.
@@ -354,10 +425,10 @@ func (w *Workspace) ensureDestinationNames(scan Scan, persist bool) error {
 		base := readableDestinationName(repo.FullName)
 		candidate := base
 		if groups[strings.ToLower(base)] > 1 {
-			candidate = destinationCandidate(base, destinationSuffix(entry.Identity, repo.ID))
+			candidate = destinationCandidate(base, destinationSuffix(w.index.Instance, repo))
 		}
 		if owner, exists := used[strings.ToLower(candidate)]; exists && owner != entry.Identity {
-			candidate = destinationCandidate(base, destinationSuffix(entry.Identity, repo.ID))
+			candidate = destinationCandidate(base, destinationSuffix(w.index.Instance, repo))
 		}
 		for attempt := 2; ; attempt++ {
 			key := strings.ToLower(candidate)
@@ -366,7 +437,7 @@ func (w *Workspace) ensureDestinationNames(scan Scan, persist bool) error {
 				break
 			}
 			// A deterministic ordinal resolves the rare case where a readable name already ends in another repository's stable suffix.
-			candidate = destinationCandidate(base, destinationSuffix(entry.Identity, repo.ID)+"-"+strconv.Itoa(attempt))
+			candidate = destinationCandidate(base, destinationSuffix(w.index.Instance, repo)+"-"+strconv.Itoa(attempt))
 		}
 		entry.DestinationName = candidate
 		changed = true
@@ -415,12 +486,12 @@ func destinationCandidate(base, suffix string) string {
 	return base + tail
 }
 
-// destinationSuffix uses the stable forge ID when available and a legacy identity prefix otherwise.
-func destinationSuffix(identity string, id int64) string {
-	if id != 0 {
-		return strconv.FormatInt(id, 10)
+// destinationSuffix uses the stable forge ID when available and a bounded legacy digest otherwise.
+func destinationSuffix(instance string, repo Repo) string {
+	if repo.ID != 0 {
+		return strconv.FormatInt(repo.ID, 10)
 	}
-	return strings.TrimPrefix(identity, "legacy:")[:12]
+	return digestPrefix(legacyRepositoryDigest(instance, repo.FullName), 12)
 }
 
 // ensureIndex resolves legacy artifacts once and optionally persists the versioned mapping before a mutation.
@@ -523,7 +594,7 @@ func (w *Workspace) buildIndex(scan Scan, inspectLegacy bool) (workspaceIndex, e
 			}
 			if directoryExists(legacyMetadata) {
 				entry.MetadataPath = filepath.ToSlash(filepath.Join("metadata", SafeName(repo.FullName)))
-				entry.MetadataComplete = true
+				entry.MetadataComplete = metadataDirectoryComplete(legacyMetadata)
 			}
 		}
 		index.Repositories = append(index.Repositories, entry)
@@ -585,8 +656,7 @@ func repositoryIdentity(instance string, repo Repo) string {
 	if repo.ID != 0 {
 		return "gitea:" + strconv.FormatInt(repo.ID, 10)
 	}
-	digest := sha256.Sum256([]byte(instance + "\x00" + repo.FullName))
-	return "legacy:" + hex.EncodeToString(digest[:])
+	return "legacy:" + legacyRepositoryDigest(instance, repo.FullName)
 }
 
 // artifactKey keeps local storage identity independent from human-readable and destination repository names.
@@ -594,8 +664,24 @@ func artifactKey(instance string, repo Repo) string {
 	if repo.ID != 0 {
 		return "repo-" + strconv.FormatInt(repo.ID, 10)
 	}
-	digest := sha256.Sum256([]byte(instance + "\x00" + repo.FullName))
-	return "legacy-" + hex.EncodeToString(digest[:])
+	return "legacy-" + legacyRepositoryDigest(instance, repo.FullName)
+}
+
+// legacyRepositoryDigest centralizes zero-ID identity derivation so every caller uses the same source inputs.
+func legacyRepositoryDigest(instance, fullName string) string {
+	digest := sha256.Sum256([]byte(instance + "\x00" + fullName))
+	return hex.EncodeToString(digest[:])
+}
+
+// digestPrefix bounds readable suffixes without assuming a digest is longer than the requested prefix.
+func digestPrefix(digest string, length int) string {
+	if length <= 0 {
+		return ""
+	}
+	if len(digest) <= length {
+		return digest
+	}
+	return digest[:length]
 }
 
 // validateFullName rejects names that cannot identify exactly one owner and repository.
@@ -661,16 +747,45 @@ func directoryExists(path string) bool {
 	return err == nil && info.IsDir()
 }
 
+// pathExists reports whether an exact transaction path exists without following a final symlink.
+func pathExists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil
+}
+
 // fileExists reports whether a path currently names a regular file.
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.Mode().IsRegular()
 }
 
+// metadataDirectoryComplete recognizes a legacy capture only when all four records decode into their expected JSON shapes.
+func metadataDirectoryComplete(path string) bool {
+	var metadata RepositoryMetadata
+	if err := readJSON(filepath.Join(path, "repo.json"), &metadata.Repository); err != nil {
+		return false
+	}
+	collections := []struct {
+		name   string
+		target *[]json.RawMessage
+	}{
+		{name: "issues.json", target: &metadata.Issues},
+		{name: "releases.json", target: &metadata.Releases},
+		{name: "labels.json", target: &metadata.Labels},
+	}
+	for _, collection := range collections {
+		if err := readJSON(filepath.Join(path, collection.name), collection.target); err != nil {
+			return false
+		}
+	}
+	return validateMetadata(metadata) == nil
+}
+
 // validateMetadata rejects incomplete or malformed captures before SaveMetadata changes durable workspace state.
 func validateMetadata(metadata RepositoryMetadata) error {
-	if !json.Valid(metadata.Repository) {
-		return errors.New("repository record is missing or invalid JSON")
+	var repository map[string]json.RawMessage
+	if !json.Valid(metadata.Repository) || json.Unmarshal(metadata.Repository, &repository) != nil || repository == nil {
+		return errors.New("repository record is missing or is not a JSON object")
 	}
 	collections := []struct {
 		name  string
