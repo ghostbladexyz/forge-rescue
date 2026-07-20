@@ -2,6 +2,7 @@ package rescue
 
 import "time"
 
+// Classify assigns an age-based risk level using creation time, with update time as the source fallback.
 func Classify(repo Repo, cfg RiskConfig, now time.Time) RiskResult {
 	createdAt := repo.CreatedAt
 	if createdAt.IsZero() {
@@ -19,6 +20,7 @@ func Classify(repo Repo, cfg RiskConfig, now time.Time) RiskResult {
 	}
 }
 
+// DefaultRiskConfig returns the repository-age thresholds documented by the CLI.
 func DefaultRiskConfig() RiskConfig {
 	return RiskConfig{HighDays: 365, MediumDays: 180}
 }

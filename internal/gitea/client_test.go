@@ -1,64 +1,168 @@
 package gitea
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
-func TestListRepositoriesIncludesUserAndOrgReposWithPagination(t *testing.T) {
-	var seenAuth bool
+// TestDiscoverPaginatesDeduplicatesAndSorts verifies every discovery path contributes once to a stable catalog.
+func TestDiscoverPaginatesDeduplicatesAndSorts(t *testing.T) {
+	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") == "token test-token" {
-			seenAuth = true
+		requests++
+		if r.Header.Get("Authorization") != "token test-token" {
+			t.Errorf("Authorization = %q, want token header", r.Header.Get("Authorization"))
 		}
-
+		page := r.URL.Query().Get("page")
 		switch r.URL.Path {
-		case "/api/v1/user":
-			writeJSON(t, w, map[string]any{"login": "alice"})
-		case "/api/v1/user/orgs":
-			writeJSON(t, w, []map[string]any{{"username": "team"}})
 		case "/api/v1/user/repos":
-			page := r.URL.Query().Get("page")
 			if page == "1" {
-				writeJSON(t, w, []map[string]any{{"full_name": "alice/app", "clone_url": "https://git.example/alice/app.git"}})
+				writeNextPage(w, r)
+				writeJSON(t, w, []map[string]any{{"id": 2, "full_name": "team/shared"}})
 				return
 			}
-			writeJSON(t, w, []map[string]any{})
+			writeLastPage(w)
+			writeJSON(t, w, []map[string]any{{"id": 1, "full_name": "alice/app"}})
+		case "/api/v1/user/orgs":
+			if page == "1" {
+				writeNextPage(w, r)
+				writeJSON(t, w, []map[string]any{{"username": "team"}})
+				return
+			}
+			writeLastPage(w)
+			writeJSON(t, w, []map[string]any{{"name": "lab"}})
+		case "/api/v1/orgs/lab/repos":
+			writeLastPage(w)
+			writeJSON(t, w, []map[string]any{{"id": 4, "full_name": "lab/tool"}})
 		case "/api/v1/orgs/team/repos":
-			page := r.URL.Query().Get("page")
-			if page == "1" {
-				writeJSON(t, w, []map[string]any{{"full_name": "team/lib", "clone_url": "https://git.example/team/lib.git"}})
-				return
-			}
-			writeJSON(t, w, []map[string]any{})
+			writeLastPage(w)
+			writeJSON(t, w, []map[string]any{
+				{"id": 3, "full_name": "team/lib"},
+				{"id": 2, "full_name": "team/shared"},
+			})
 		default:
-			t.Fatalf("unexpected path: %s", r.URL.Path)
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, "test-token")
-	repos, err := client.ListRepositories(t.Context())
+	source, err := NewSource(server.URL, "test-token")
 	if err != nil {
-		t.Fatalf("ListRepositories returned error: %v", err)
+		t.Fatalf("NewSource returned error: %v", err)
 	}
-	if !seenAuth {
-		t.Fatal("expected Authorization token header")
+	repositories, err := source.Discover(context.Background())
+	if err != nil {
+		t.Fatalf("Discover returned error: %v", err)
 	}
-	if len(repos) != 2 {
-		t.Fatalf("repo count = %d, want 2", len(repos))
+	want := []string{"alice/app", "lab/tool", "team/lib", "team/shared"}
+	if len(repositories) != len(want) {
+		t.Fatalf("repository count = %d, want %d", len(repositories), len(want))
 	}
-	if repos[0].FullName != "alice/app" || repos[1].FullName != "team/lib" {
-		t.Fatalf("repos = %#v, want user repo followed by org repo", repos)
+	for index, fullName := range want {
+		if repositories[index].FullName != fullName {
+			t.Fatalf("repositories = %#v, want sorted names %#v", repositories, want)
+		}
+	}
+	if requests != 6 {
+		t.Fatalf("request count = %d, want 6 paginated requests", requests)
 	}
 }
 
+// TestDiscoverRejectsIdentityConflicts verifies duplicate source IDs cannot silently identify different repositories.
+func TestDiscoverRejectsIdentityConflicts(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/user/repos":
+			writeLastPage(w)
+			writeJSON(t, w, []map[string]any{{"id": 7, "full_name": "alice/one"}, {"id": 7, "full_name": "alice/two"}})
+		case "/api/v1/user/orgs":
+			writeLastPage(w)
+			writeJSON(t, w, []map[string]any{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	source, err := NewSource(server.URL, "token")
+	if err != nil {
+		t.Fatalf("NewSource returned error: %v", err)
+	}
+	_, err = source.Discover(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "belongs to both") {
+		t.Fatalf("Discover error = %v, want conflicting identity context", err)
+	}
+}
+
+// TestDiscoverRejectsRepeatedHeaderlessPage verifies ignored page parameters fail instead of looping forever.
+func TestDiscoverRejectsRepeatedHeaderlessPage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/user/repos" {
+			writeJSON(t, w, []map[string]any{{"id": 1, "full_name": "alice/app"}})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	source, err := NewSource(server.URL, "token")
+	if err != nil {
+		t.Fatalf("NewSource returned error: %v", err)
+	}
+	_, err = source.Discover(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "repeated page 1 as page 2") {
+		t.Fatalf("Discover error = %v, want repeated-page protection", err)
+	}
+}
+
+// TestNewSourceRejectsUnsafeInstanceURLs verifies credentials and ambiguous URL suffixes never enter request construction.
+func TestNewSourceRejectsUnsafeInstanceURLs(t *testing.T) {
+	for _, instanceURL := range []string{"git.example", "ftp://git.example", "https://user:secret@git.example", "https://git.example?token=secret", "https://git.example#fragment"} {
+		if _, err := NewSource(instanceURL, "token"); err == nil {
+			t.Errorf("NewSource(%q) returned nil error", instanceURL)
+		}
+	}
+}
+
+// TestSourceErrorsAreBoundedAndTokenFree verifies hostile remote text cannot leak credentials or create unbounded diagnostics.
+func TestSourceErrorsAreBoundedAndTokenFree(t *testing.T) {
+	const token = "secret-token"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(token + strings.Repeat("x", maxErrorBodySize*2)))
+	}))
+	defer server.Close()
+
+	source, err := NewSource(server.URL, token)
+	if err != nil {
+		t.Fatalf("NewSource returned error: %v", err)
+	}
+	_, err = source.Discover(context.Background())
+	if err == nil || strings.Contains(err.Error(), token) || len(err.Error()) > maxErrorBodySize+300 {
+		t.Fatalf("Discover error is not safely bounded/redacted: length=%d error=%v", len(err.Error()), err)
+	}
+}
+
+// writeNextPage advertises page two because Source follows Gitea's Link pagination contract.
+func writeNextPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Link", "<"+r.URL.Path+"?page=2>; rel=\"next\"")
+}
+
+// writeLastPage supplies a non-next Link header so a nonempty fixture page is unambiguously terminal.
+func writeLastPage(w http.ResponseWriter) {
+	w.Header().Set("Link", `</previous>; rel="prev"`)
+}
+
+// writeJSON encodes one HTTP fixture response and reports failures against the active test.
 func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(value); err != nil {
-		t.Fatalf("encoding json: %v", err)
+		t.Fatalf("encoding JSON: %v", err)
 	}
 }

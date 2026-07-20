@@ -1,6 +1,9 @@
 package rescue
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 const (
 	RiskHigh   = "HIGH"
@@ -31,6 +34,14 @@ type Scan struct {
 	Repos     []Repo    `json:"repos"`
 }
 
+// RepositoryMetadata is one complete archival capture returned by the source forge before workspace persistence begins.
+type RepositoryMetadata struct {
+	Repository json.RawMessage
+	Issues     []json.RawMessage
+	Releases   []json.RawMessage
+	Labels     []json.RawMessage
+}
+
 type Manifest struct {
 	Instance   string    `json:"instance"`
 	RescuedAt  time.Time `json:"rescued_at"`
@@ -38,12 +49,30 @@ type Manifest struct {
 	Success    int       `json:"success"`
 	Failed     int       `json:"failed"`
 	Failures   []Failure `json:"failures,omitempty"`
+	Outcomes   []Outcome `json:"outcomes,omitempty"`
 }
 
 type Failure struct {
 	Repo  string `json:"repo"`
 	Error string `json:"error"`
 }
+
+// Outcome records enough phase detail to distinguish a resumable partial rescue from a complete rescue.
+type Outcome struct {
+	Repo             string `json:"repo"`
+	Identity         string `json:"identity"`
+	ArtifactKey      string `json:"artifact_key"`
+	Status           string `json:"status"`
+	MirrorComplete   bool   `json:"mirror_complete"`
+	MetadataComplete bool   `json:"metadata_complete"`
+	Error            string `json:"error,omitempty"`
+}
+
+const (
+	OutcomeComplete = "complete"
+	OutcomePartial  = "partial"
+	OutcomeFailed   = "failed"
+)
 
 type RiskConfig struct {
 	HighDays   int

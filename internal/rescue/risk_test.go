@@ -5,6 +5,7 @@ import (
 	"time"
 )
 
+// TestClassifyRiskUsesCreatedAtEvenWhenRecentlyPushed verifies activity cannot hide age-based deletion risk.
 func TestClassifyRiskUsesCreatedAtEvenWhenRecentlyPushed(t *testing.T) {
 	now := time.Date(2026, 5, 9, 20, 0, 0, 0, time.UTC)
 	repo := Repo{
@@ -24,6 +25,7 @@ func TestClassifyRiskUsesCreatedAtEvenWhenRecentlyPushed(t *testing.T) {
 	}
 }
 
+// TestClassifyRiskUsesCreatedAtForMediumRisk verifies the lower age threshold uses the same source timestamp.
 func TestClassifyRiskUsesCreatedAtForMediumRisk(t *testing.T) {
 	now := time.Date(2026, 5, 9, 20, 0, 0, 0, time.UTC)
 	repo := Repo{
@@ -39,6 +41,7 @@ func TestClassifyRiskUsesCreatedAtForMediumRisk(t *testing.T) {
 	}
 }
 
+// ptrTime keeps pointer timestamp setup readable in repository fixtures.
 func ptrTime(t time.Time) *time.Time {
 	return &t
 }
