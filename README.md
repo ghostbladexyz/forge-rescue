@@ -1,7 +1,7 @@
 # forge-rescue
 
 [![CI](https://github.com/ghostbladexyz/forge-rescue/actions/workflows/ci.yml/badge.svg)](https://github.com/ghostbladexyz/forge-rescue/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/ghostbladexyz/forge-rescue)](https://github.com/ghostbladexyz/forge-rescue/releases/latest)
+[![Latest tag](https://img.shields.io/github/v/tag/ghostbladexyz/forge-rescue)](https://github.com/ghostbladexyz/forge-rescue/tags)
 [![Go version](https://img.shields.io/github/go-mod/go-version/ghostbladexyz/forge-rescue?logo=go)](go.mod)
 
 `forge-rescue` is a small CLI for evacuating repositories from a Gitea instance before *age-based deletion*.
