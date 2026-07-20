@@ -79,6 +79,30 @@ func (a *httpAdapter) AuthenticatedUser(ctx context.Context) (string, error) {
 	return user.Login, nil
 }
 
+// ActiveOrganizationMembership verifies that the authenticated user has accepted membership in the selected organization.
+func (a *httpAdapter) ActiveOrganizationMembership(ctx context.Context, owner string) (bool, error) {
+	path := "/user/memberships/orgs/" + url.PathEscape(owner)
+	response, err := a.do(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return false, err
+	}
+	defer response.Body.Close()
+	switch response.StatusCode {
+	case http.StatusOK:
+		var membership struct {
+			State string `json:"state"`
+		}
+		if err := json.NewDecoder(response.Body).Decode(&membership); err != nil {
+			return false, fmt.Errorf("decode GitHub organization membership: %w", err)
+		}
+		return membership.State == "active", nil
+	case http.StatusNotFound:
+		return false, nil
+	default:
+		return false, a.responseError("get GitHub organization membership", response)
+	}
+}
+
 // RepositoryExists distinguishes an absent destination from all authorization and transport failures.
 func (a *httpAdapter) RepositoryExists(ctx context.Context, owner, name string) (bool, error) {
 	response, err := a.do(ctx, http.MethodGet, repositoryPath(owner, name), nil)

@@ -85,6 +85,7 @@ type DeleteOutcome struct {
 
 type repositoryPort interface {
 	AuthenticatedUser(ctx context.Context) (string, error)
+	ActiveOrganizationMembership(ctx context.Context, owner string) (bool, error)
 	RepositoryExists(ctx context.Context, owner, name string) (bool, error)
 	CreateUserRepository(ctx context.Context, name string) error
 	CreateOrganizationRepository(ctx context.Context, owner, name string) error
@@ -125,18 +126,21 @@ func (d *Destination) Upload(ctx context.Context, request UploadRequest) (Upload
 	if err := d.validateUpload(request); err != nil {
 		return report, err
 	}
-	report.UploadedAt = d.now().UTC()
+	userOwner, err := d.resolveOwner(ctx, request.Owner)
+	if err != nil {
+		return report, err
+	}
+	now := d.now
+	if now == nil {
+		now = time.Now
+	}
+	report.UploadedAt = now().UTC()
 	repositories, err := request.Workspace.UploadRepositories()
 	if err != nil {
 		return report, fmt.Errorf("prepare upload repositories: %w", err)
 	}
 	report.ReposTotal = len(repositories)
 
-	authenticatedUser, err := d.repositories.AuthenticatedUser(ctx)
-	if err != nil {
-		return report, fmt.Errorf("resolve GitHub destination owner: %w", err)
-	}
-	userOwner := strings.EqualFold(authenticatedUser, request.Owner)
 	for _, repository := range repositories {
 		outcome := d.uploadOne(ctx, request.Owner, userOwner, request.Existing, repository)
 		report.Outcomes = append(report.Outcomes, outcome)
@@ -171,6 +175,9 @@ func (d *Destination) Delete(ctx context.Context, request DeleteRequest) (Delete
 	if err := d.validateDelete(request); err != nil {
 		return report, err
 	}
+	if _, err := d.resolveOwner(ctx, request.Owner); err != nil {
+		return report, err
+	}
 	for _, name := range request.Repositories {
 		outcome := DeleteOutcome{Repository: name}
 		deleted, err := d.repositories.DeleteRepository(ctx, request.Owner, name)
@@ -199,6 +206,25 @@ func (d *Destination) Delete(ctx context.Context, request DeleteRequest) (Delete
 		return report, fmt.Errorf("deleted %d repositories with %d failures and %d skips", report.Deleted, report.Failed, report.Skipped)
 	}
 	return report, nil
+}
+
+// resolveOwner accepts only the authenticated user or an active organization membership before any local or remote mutation begins.
+func (d *Destination) resolveOwner(ctx context.Context, owner string) (bool, error) {
+	authenticatedUser, err := d.repositories.AuthenticatedUser(ctx)
+	if err != nil {
+		return false, fmt.Errorf("resolve authenticated GitHub user: %w", err)
+	}
+	if strings.EqualFold(authenticatedUser, owner) {
+		return true, nil
+	}
+	active, err := d.repositories.ActiveOrganizationMembership(ctx, owner)
+	if err != nil {
+		return false, fmt.Errorf("validate GitHub organization %q: %w", owner, err)
+	}
+	if !active {
+		return false, fmt.Errorf("GitHub owner %q is neither the authenticated user nor an active accessible organization", owner)
+	}
+	return false, nil
 }
 
 // uploadOne applies create/fill/replace policy before publishing one workspace-owned mirror.
@@ -266,9 +292,6 @@ func (d *Destination) validateUpload(request UploadRequest) error {
 	if d.repositories == nil || d.mirrors == nil {
 		return fmt.Errorf("GitHub destination is incomplete")
 	}
-	if d.now == nil {
-		d.now = time.Now
-	}
 	if request.Existing != CreateOrFillEmpty && request.Existing != ReplaceExistingRefs {
 		return fmt.Errorf("unknown existing repository policy %d", request.Existing)
 	}
@@ -303,10 +326,21 @@ func (d *Destination) validateDelete(request DeleteRequest) error {
 	return nil
 }
 
-// validateOwner keeps path construction unambiguous without imposing GitHub's evolving account-name rules locally.
+// validateOwner enforces GitHub login characters locally so malformed owners never reach identity or membership lookups.
 func validateOwner(owner string) error {
-	if owner == "" || strings.TrimSpace(owner) != owner || strings.ContainsAny(owner, "/\\") {
+	if owner == "" || len(owner) > 39 || owner[0] == '-' || owner[len(owner)-1] == '-' {
 		return fmt.Errorf("GitHub owner must be one exact account name")
+	}
+	previousHyphen := false
+	for _, character := range owner {
+		alphanumeric := character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9'
+		if !alphanumeric && character != '-' {
+			return fmt.Errorf("GitHub owner must be one exact account name")
+		}
+		if character == '-' && previousHyphen {
+			return fmt.Errorf("GitHub owner must be one exact account name")
+		}
+		previousHyphen = character == '-'
 	}
 	return nil
 }

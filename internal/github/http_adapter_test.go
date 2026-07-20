@@ -100,6 +100,44 @@ func TestHTTPAdapterHandlesRepositoryStates(t *testing.T) {
 	}
 }
 
+// TestHTTPAdapterValidatesActiveOrganizationMembership verifies active, pending, absent, and unauthorized owner responses remain distinct.
+func TestHTTPAdapterValidatesActiveOrganizationMembership(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user/memberships/orgs/active-org":
+			writeAdapterJSON(t, w, http.StatusOK, map[string]string{"state": "active"})
+		case "/user/memberships/orgs/pending-org":
+			writeAdapterJSON(t, w, http.StatusOK, map[string]string{"state": "pending"})
+		case "/user/memberships/orgs/missing-org":
+			w.WriteHeader(http.StatusNotFound)
+		case "/user/memberships/orgs/blocked-org":
+			writeAdapterJSON(t, w, http.StatusForbidden, map[string]string{"message": "organization blocked this token"})
+		default:
+			t.Fatalf("unexpected membership path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	adapter := newHTTPAdapter(server.URL, "token", server.Client())
+
+	if active, err := adapter.ActiveOrganizationMembership(context.Background(), "active-org"); err != nil || !active {
+		t.Fatalf("active membership = %v, %v", active, err)
+	}
+	if active, err := adapter.ActiveOrganizationMembership(context.Background(), "pending-org"); err != nil || active {
+		t.Fatalf("pending membership = %v, %v", active, err)
+	}
+	if active, err := adapter.ActiveOrganizationMembership(context.Background(), "missing-org"); err != nil || active {
+		t.Fatalf("missing membership = %v, %v", active, err)
+	}
+	if _, err := adapter.ActiveOrganizationMembership(context.Background(), "blocked-org"); err == nil {
+		t.Fatal("blocked membership returned nil error")
+	} else {
+		var githubErr *githubError
+		if !errors.As(err, &githubErr) || githubErr.StatusCode != http.StatusForbidden || !strings.Contains(err.Error(), "[redacted]") || strings.Contains(err.Error(), "this token") {
+			t.Fatalf("blocked membership error = %#v", err)
+		}
+	}
+}
+
 // TestHTTPAdapterReturnsBoundedStructuredErrors verifies GitHub diagnostics survive without returning raw response bodies.
 func TestHTTPAdapterReturnsBoundedStructuredErrors(t *testing.T) {
 	token := "secret-token"

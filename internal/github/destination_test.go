@@ -27,7 +27,11 @@ func TestUploadResolvesUserAndOrganizationCreation(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			workspace := uploadWorkspace(t, []rescue.Repo{{ID: 7, FullName: "team/project"}})
-			repositories := &recordingRepositoryPort{authenticatedUser: "alice", exists: map[string]bool{}}
+			repositories := &recordingRepositoryPort{
+				authenticatedUser: "alice",
+				exists:            map[string]bool{},
+				memberships:       map[string]bool{"rescue-org": true},
+			}
 			mirrors := &recordingPublisher{}
 			destination := newDestination("token", repositories, mirrors, fixedTime)
 
@@ -96,11 +100,89 @@ func TestUploadRecordsFailuresAndPersistsStructuredOutcomes(t *testing.T) {
 	}
 }
 
+// TestUploadRejectsInvalidAndOtherUserOwners verifies an owner must be the authenticated user or an active organization.
+func TestUploadRejectsInvalidAndOtherUserOwners(t *testing.T) {
+	tests := []struct {
+		name  string
+		owner string
+	}{
+		{name: "invalid owner", owner: "other/user"},
+		{name: "invalid owner characters", owner: "other_user"},
+		{name: "different user", owner: "bob"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			workspace := uploadWorkspace(t, []rescue.Repo{{ID: 10, FullName: "team/project"}})
+			repositories := &recordingRepositoryPort{authenticatedUser: "alice"}
+			mirrors := &recordingPublisher{}
+			destination := newDestination("token", repositories, mirrors, fixedTime)
+
+			_, err := destination.Upload(context.Background(), UploadRequest{Workspace: workspace, Owner: test.owner})
+			if err == nil {
+				t.Fatalf("Upload(%q) returned nil, want owner preflight error", test.owner)
+			}
+			if repositories.inspections != 0 || len(repositories.created) != 0 || mirrors.pushes != 0 {
+				t.Fatalf("owner preflight mutated inspection/create/push = %d/%#v/%d", repositories.inspections, repositories.created, mirrors.pushes)
+			}
+			if strings.HasPrefix(test.name, "invalid owner") && repositories.authenticatedCalls != 0 {
+				t.Fatalf("invalid owner made %d authenticated-user requests", repositories.authenticatedCalls)
+			}
+		})
+	}
+}
+
+// TestUploadRejectsUnauthorizedOrganization verifies membership errors cannot fall through to organization creation.
+func TestUploadRejectsUnauthorizedOrganization(t *testing.T) {
+	workspace := uploadWorkspace(t, []rescue.Repo{{ID: 11, FullName: "team/project"}})
+	repositories := &recordingRepositoryPort{
+		authenticatedUser: "alice",
+		membershipErrors:  map[string]error{"blocked-org": errors.New("forbidden")},
+	}
+	mirrors := &recordingPublisher{}
+	destination := newDestination("token", repositories, mirrors, fixedTime)
+
+	_, err := destination.Upload(context.Background(), UploadRequest{Workspace: workspace, Owner: "blocked-org"})
+	if err == nil || !strings.Contains(err.Error(), "forbidden") {
+		t.Fatalf("Upload error = %v, want organization authorization failure", err)
+	}
+	if len(repositories.created) != 0 || repositories.inspections != 0 || mirrors.pushes != 0 {
+		t.Fatalf("unauthorized organization mutated create/inspection/push = %#v/%d/%d", repositories.created, repositories.inspections, mirrors.pushes)
+	}
+}
+
+// TestOwnerPreflightPrecedesWorkspaceMutation verifies rejected owners cannot persist destination allocation locally.
+func TestOwnerPreflightPrecedesWorkspaceMutation(t *testing.T) {
+	workspace := uploadWorkspace(t, []rescue.Repo{{ID: 12, FullName: "team/project"}})
+	rescued, err := workspace.RescuedRepositories()
+	if err != nil || len(rescued) != 1 {
+		t.Fatalf("RescuedRepositories = %#v, %v", rescued, err)
+	}
+	indexPath := filepath.Join(filepath.Dir(filepath.Dir(rescued[0].Artifact.MirrorPath)), "workspace.json")
+	before, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatalf("reading workspace before preflight: %v", err)
+	}
+	repositories := &recordingRepositoryPort{authenticatedUser: "alice"}
+	destination := newDestination("token", repositories, &recordingPublisher{}, fixedTime)
+
+	_, err = destination.Upload(context.Background(), UploadRequest{Workspace: workspace, Owner: "bob"})
+	if err == nil {
+		t.Fatal("Upload returned nil, want owner preflight error")
+	}
+	after, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatalf("reading workspace after preflight: %v", err)
+	}
+	if string(after) != string(before) || strings.Contains(string(after), "destination_name") {
+		t.Fatalf("workspace changed before owner validation:\n%s", after)
+	}
+}
+
 // TestDeletePreflightsExactNamesBeforeMutation verifies source-style names and case-insensitive duplicates fail closed.
 func TestDeletePreflightsExactNamesBeforeMutation(t *testing.T) {
 	tests := [][]string{{"team/project"}, {"Project", "project"}}
 	for _, names := range tests {
-		repositories := &recordingRepositoryPort{}
+		repositories := &recordingRepositoryPort{authenticatedUser: "alice"}
 		destination := newDestination("token", repositories, &recordingPublisher{}, fixedTime)
 		_, err := destination.Delete(context.Background(), DeleteRequest{Owner: "alice", Repositories: names})
 		if err == nil {
@@ -112,11 +194,26 @@ func TestDeletePreflightsExactNamesBeforeMutation(t *testing.T) {
 	}
 }
 
+// TestDeleteOwnerPreflightPrecedesMutation verifies an unaffiliated owner is rejected before the first irreversible delete.
+func TestDeleteOwnerPreflightPrecedesMutation(t *testing.T) {
+	repositories := &recordingRepositoryPort{authenticatedUser: "alice"}
+	destination := newDestination("token", repositories, &recordingPublisher{}, fixedTime)
+
+	_, err := destination.Delete(context.Background(), DeleteRequest{Owner: "bob", Repositories: []string{"project"}})
+	if err == nil {
+		t.Fatal("Delete returned nil, want owner preflight error")
+	}
+	if len(repositories.deleted) != 0 {
+		t.Fatalf("Delete mutated repositories before owner preflight: %#v", repositories.deleted)
+	}
+}
+
 // TestDeleteReportsDeletedSkippedAndFailed verifies exact HTTP outcomes remain distinct in the workflow report.
 func TestDeleteReportsDeletedSkippedAndFailed(t *testing.T) {
 	repositories := &recordingRepositoryPort{
-		deleteResults: map[string]bool{"alice/removed": true},
-		deleteErrors:  map[string]error{"alice/blocked": errors.New("forbidden")},
+		authenticatedUser: "alice",
+		deleteResults:     map[string]bool{"alice/removed": true},
+		deleteErrors:      map[string]error{"alice/blocked": errors.New("forbidden")},
 	}
 	destination := newDestination("token", repositories, &recordingPublisher{}, fixedTime)
 	report, err := destination.Delete(context.Background(), DeleteRequest{
@@ -135,22 +232,35 @@ func TestDeleteReportsDeletedSkippedAndFailed(t *testing.T) {
 }
 
 type recordingRepositoryPort struct {
-	authenticatedUser string
-	exists            map[string]bool
-	refs              map[string]bool
-	created           []string
-	deleted           []string
-	deleteResults     map[string]bool
-	deleteErrors      map[string]error
+	authenticatedUser  string
+	authenticatedCalls int
+	memberships        map[string]bool
+	membershipErrors   map[string]error
+	membershipCalls    []string
+	inspections        int
+	exists             map[string]bool
+	refs               map[string]bool
+	created            []string
+	deleted            []string
+	deleteResults      map[string]bool
+	deleteErrors       map[string]error
 }
 
 // AuthenticatedUser returns the configured login used to choose user or organization creation.
 func (r *recordingRepositoryPort) AuthenticatedUser(ctx context.Context) (string, error) {
+	r.authenticatedCalls++
 	return r.authenticatedUser, nil
+}
+
+// ActiveOrganizationMembership returns the configured active state or authorization failure for one organization.
+func (r *recordingRepositoryPort) ActiveOrganizationMembership(ctx context.Context, owner string) (bool, error) {
+	r.membershipCalls = append(r.membershipCalls, owner)
+	return r.memberships[owner], r.membershipErrors[owner]
 }
 
 // RepositoryExists returns the configured destination state without remote I/O.
 func (r *recordingRepositoryPort) RepositoryExists(ctx context.Context, owner, name string) (bool, error) {
+	r.inspections++
 	return r.exists[owner+"/"+name], nil
 }
 
