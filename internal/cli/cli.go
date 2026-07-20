@@ -6,30 +6,37 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/ghostbladexyz/forge-rescue/internal/gitea"
 	"github.com/ghostbladexyz/forge-rescue/internal/github"
+	"github.com/ghostbladexyz/forge-rescue/internal/gitmirror"
 	"github.com/ghostbladexyz/forge-rescue/internal/rescue"
-	"github.com/ghostbladexyz/forge-rescue/internal/upload"
 )
 
 type Env struct {
-	Token            string
-	GitHubToken      string
-	Now              func() time.Time
-	CommandRunner    rescue.CommandRunner
-	MetadataExporter rescue.MetadataExporter
-	GitHubClient     gitHubClient
+	Token          string
+	GitHubToken    string
+	Now            func() time.Time
+	GitMirrors     gitMirrorOperations
+	MetadataSource metadataCapturer
+	GitHub         githubDestination
 }
 
-type gitHubClient interface {
-	upload.GitHubClient
-	DeleteRepository(ctx context.Context, owner, name string) error
+type gitMirrorOperations interface {
+	rescue.MirrorCloner
 }
 
+type metadataCapturer interface {
+	CaptureMetadata(ctx context.Context, repo rescue.Repo) (rescue.RepositoryMetadata, error)
+}
+
+type githubDestination interface {
+	Upload(ctx context.Context, request github.UploadRequest) (github.UploadReport, error)
+	Delete(ctx context.Context, request github.DeleteRequest) (github.DeleteReport, error)
+}
+
+// Run dispatches one CLI command after applying injectable defaults shared by every workflow.
 func Run(ctx context.Context, args []string, env Env, out io.Writer) error {
 	if len(args) == 0 {
 		return usage(out)
@@ -39,6 +46,9 @@ func Run(ctx context.Context, args []string, env Env, out io.Writer) error {
 	}
 	if env.Now == nil {
 		env.Now = time.Now
+	}
+	if env.GitMirrors == nil {
+		env.GitMirrors = gitmirror.New()
 	}
 
 	switch args[0] {
@@ -55,6 +65,7 @@ func Run(ctx context.Context, args []string, env Env, out io.Writer) error {
 	}
 }
 
+// runScan captures the accessible source repositories into the selected rescue workspace.
 func runScan(ctx context.Context, args []string, env Env, out io.Writer) error {
 	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -70,16 +81,20 @@ func runScan(ctx context.Context, args []string, env Env, out io.Writer) error {
 		return fmt.Errorf("set FORGE_RESCUE_TOKEN or provide a token in the environment")
 	}
 
-	client := gitea.NewClient(*instance, env.Token)
-	repos, err := client.ListRepositories(ctx)
+	source, err := gitea.NewSource(*instance, env.Token)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
+	repos, err := source.Discover(ctx)
+	if err != nil {
 		return err
 	}
 	scan := rescue.Scan{Instance: *instance, ScannedAt: env.Now().UTC(), Repos: repos}
-	if err := rescue.WriteScan(filepath.Join(*dataDir, "scan.json"), scan); err != nil {
+	workspace, err := rescue.OpenWorkspace(*dataDir)
+	if err != nil {
+		return err
+	}
+	if err := workspace.SaveScan(scan); err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "Found %d repositories\n", len(repos))
@@ -87,6 +102,7 @@ func runScan(ctx context.Context, args []string, env Env, out io.Writer) error {
 	return nil
 }
 
+// runRescue selects scanned repositories and delegates artifact paths and Git transport to their owning modules.
 func runRescue(ctx context.Context, args []string, env Env, out io.Writer) error {
 	fs := flag.NewFlagSet("rescue", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -108,24 +124,31 @@ func runRescue(ctx context.Context, args []string, env Env, out io.Writer) error
 		selection.Risk = rescue.RiskMedium
 	}
 
-	exporter := env.MetadataExporter
-	if exporter == nil {
+	metadataSource := env.MetadataSource
+	if metadataSource == nil {
 		if env.Token == "" {
 			env.Token = os.Getenv("FORGE_RESCUE_TOKEN")
 		}
-		scan, err := rescue.ReadScan(filepath.Join(*dataDir, "scan.json"))
+		workspace, err := rescue.OpenWorkspace(*dataDir)
 		if err != nil {
 			return err
 		}
-		exporter = gitea.NewClient(scan.Instance, env.Token)
+		scan, err := workspace.LoadScan()
+		if err != nil {
+			return err
+		}
+		metadataSource, err = gitea.NewSource(scan.Instance, env.Token)
+		if err != nil {
+			return err
+		}
 	}
 
 	err := rescue.Run(ctx, rescue.Options{
-		DataDir:          *dataDir,
-		Selection:        selection,
-		Now:              env.Now,
-		CommandRunner:    env.CommandRunner,
-		MetadataExporter: exporter,
+		DataDir:        *dataDir,
+		Selection:      selection,
+		Now:            env.Now,
+		GitMirrors:     env.GitMirrors,
+		MetadataSource: metadataSource,
 	})
 	if err != nil {
 		return err
@@ -134,6 +157,7 @@ func runRescue(ctx context.Context, args []string, env Env, out io.Writer) error
 	return nil
 }
 
+// runUpload validates GitHub upload arguments before delegating destination and mirror behavior.
 func runUpload(ctx context.Context, args []string, env Env, out io.Writer) error {
 	if len(args) == 0 {
 		return fmt.Errorf("upload requires a provider")
@@ -146,26 +170,33 @@ func runUpload(ctx context.Context, args []string, env Env, out io.Writer) error
 	fs.SetOutput(io.Discard)
 	owner := fs.String("owner", "", "GitHub user or organization that will receive repositories")
 	dataDir := fs.String("data-dir", "forge-rescue-data", "output directory")
-	forceExisting := fs.Bool("force-existing", false, "push into existing non-empty GitHub repositories")
+	replaceExisting := fs.Bool("replace-existing-refs", false, "replace all refs in existing non-empty GitHub repositories")
+	forceExisting := fs.Bool("force-existing", false, "deprecated alias for --replace-existing-refs")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 	if env.GitHubToken == "" {
 		env.GitHubToken = os.Getenv("GITHUB_TOKEN")
 	}
-
-	client := env.GitHubClient
-	if client == nil {
-		client = github.NewClient(env.GitHubToken)
+	workspace, err := rescue.OpenWorkspace(*dataDir)
+	if err != nil {
+		return err
 	}
-	err := upload.Run(ctx, upload.Options{
-		DataDir:       *dataDir,
-		Owner:         *owner,
-		Token:         env.GitHubToken,
-		ForceExisting: *forceExisting,
-		GitHub:        client,
-		CommandRunner: env.CommandRunner,
-		Now:           env.Now,
+	destination := env.GitHub
+	if destination == nil {
+		destination = github.New(env.GitHubToken)
+	}
+	policy := github.CreateOrFillEmpty
+	if *replaceExisting || *forceExisting {
+		policy = github.ReplaceExistingRefs
+	}
+	if *forceExisting {
+		fmt.Fprintln(out, "Warning: --force-existing is deprecated; use --replace-existing-refs")
+	}
+	_, err = destination.Upload(ctx, github.UploadRequest{
+		Workspace: workspace,
+		Owner:     *owner,
+		Existing:  policy,
 	})
 	if err != nil {
 		return err
@@ -174,6 +205,7 @@ func runUpload(ctx context.Context, args []string, env Env, out io.Writer) error
 	return nil
 }
 
+// runDelete requires explicit destructive intent before removing named GitHub repositories.
 func runDelete(ctx context.Context, args []string, env Env, out io.Writer) error {
 	if len(args) == 0 {
 		return fmt.Errorf("delete requires a provider")
@@ -185,15 +217,15 @@ func runDelete(ctx context.Context, args []string, env Env, out io.Writer) error
 	fs := flag.NewFlagSet("delete github", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	owner := fs.String("owner", "", "GitHub user or organization that owns repositories")
-	deleteRepo := fs.Bool("delete-repo", false, "delete the named GitHub repositories")
+	confirmDelete := fs.String("confirm-delete", "", "repeat OWNER to confirm permanent repository deletion")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 	if *owner == "" {
 		return fmt.Errorf("delete github requires --owner")
 	}
-	if !*deleteRepo {
-		return fmt.Errorf("delete github requires --delete-repo")
+	if *confirmDelete != *owner {
+		return fmt.Errorf("delete github requires --confirm-delete OWNER matching --owner exactly")
 	}
 	names := fs.Args()
 	if len(names) == 0 {
@@ -206,26 +238,26 @@ func runDelete(ctx context.Context, args []string, env Env, out io.Writer) error
 		return fmt.Errorf("set GITHUB_TOKEN or provide a GitHub token in the environment")
 	}
 
-	client := env.GitHubClient
-	if client == nil {
-		client = github.NewClient(env.GitHubToken)
+	destination := env.GitHub
+	if destination == nil {
+		destination = github.New(env.GitHubToken)
 	}
-
-	var failures []string
-	for _, name := range names {
-		repoName := rescue.SafeName(name)
-		if err := client.DeleteRepository(ctx, *owner, repoName); err != nil {
-			failures = append(failures, fmt.Sprintf("%s: %v", repoName, err))
-			continue
+	report, err := destination.Delete(ctx, github.DeleteRequest{Owner: *owner, Repositories: names})
+	for _, outcome := range report.Outcomes {
+		switch outcome.Status {
+		case github.DeleteRemoved:
+			fmt.Fprintf(out, "Deleted %s/%s\n", *owner, outcome.Repository)
+		case github.DeleteSkippedNotFound:
+			fmt.Fprintf(out, "Skipped %s/%s: not found or inaccessible\n", *owner, outcome.Repository)
 		}
-		fmt.Fprintf(out, "Deleted %s/%s\n", *owner, repoName)
 	}
-	if len(failures) > 0 {
-		return fmt.Errorf("deleted %d repos with %d failures: %s", len(names)-len(failures), len(failures), strings.Join(failures, "; "))
+	if err != nil {
+		return err
 	}
 	return nil
 }
 
+// printRiskSummary groups scanned repositories using the same classification rules as rescue selection.
 func printRiskSummary(out io.Writer, repos []rescue.Repo, now time.Time) {
 	cfg := rescue.DefaultRiskConfig()
 	groups := []struct {
@@ -249,7 +281,8 @@ func printRiskSummary(out io.Writer, repos []rescue.Repo, now time.Time) {
 	}
 }
 
+// usage writes the compact command overview used when no command is supplied.
 func usage(out io.Writer) error {
-	fmt.Fprintln(out, "usage: forge-rescue scan --instance URL | forge-rescue rescue [--high-risk|--medium-risk] [owner/repo...] | forge-rescue upload github --owner OWNER | forge-rescue delete github --owner OWNER --delete-repo repo...")
+	fmt.Fprintln(out, "usage: forge-rescue scan --instance URL | forge-rescue rescue [--high-risk|--medium-risk] [owner/repo...] | forge-rescue upload github --owner OWNER | forge-rescue delete github --owner OWNER --confirm-delete OWNER repo...")
 	return nil
 }

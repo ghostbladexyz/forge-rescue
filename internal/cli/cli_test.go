@@ -4,16 +4,22 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/ghostbladexyz/forge-rescue/internal/github"
+	"github.com/ghostbladexyz/forge-rescue/internal/gitmirror"
 	"github.com/ghostbladexyz/forge-rescue/internal/rescue"
 )
 
+// TestScanCommandWritesScanFile verifies CLI scan composition persists the discovered source catalog.
 func TestScanCommandWritesScanFile(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -53,6 +59,7 @@ func TestScanCommandWritesScanFile(t *testing.T) {
 	}
 }
 
+// TestRescueCommandSelectsHighRisk verifies the high-risk flag reaches rescue selection.
 func TestRescueCommandSelectsHighRisk(t *testing.T) {
 	tmp := t.TempDir()
 	old := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -72,8 +79,8 @@ func TestRescueCommandSelectsHighRisk(t *testing.T) {
 		Now: func() time.Time {
 			return time.Date(2026, 5, 9, 0, 0, 0, 0, time.UTC)
 		},
-		CommandRunner:    &recordingRunner{},
-		MetadataExporter: &recordingExporter{},
+		GitMirrors:     &recordingMirrors{},
+		MetadataSource: &recordingMetadataSource{},
 	}, &out)
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
@@ -88,6 +95,7 @@ func TestRescueCommandSelectsHighRisk(t *testing.T) {
 	}
 }
 
+// TestRescueCommandSelectsMediumRisk verifies the medium-risk flag excludes high-risk repositories.
 func TestRescueCommandSelectsMediumRisk(t *testing.T) {
 	tmp := t.TempDir()
 	now := time.Date(2026, 5, 9, 0, 0, 0, 0, time.UTC)
@@ -108,8 +116,8 @@ func TestRescueCommandSelectsMediumRisk(t *testing.T) {
 		Now: func() time.Time {
 			return now
 		},
-		CommandRunner:    &recordingRunner{},
-		MetadataExporter: &recordingExporter{},
+		GitMirrors:     &recordingMirrors{},
+		MetadataSource: &recordingMetadataSource{},
 	}, &out)
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
@@ -124,7 +132,8 @@ func TestRescueCommandSelectsMediumRisk(t *testing.T) {
 	}
 }
 
-func TestUploadGitHubCommandUsesGitHubTokenAndOwner(t *testing.T) {
+// TestUploadGitHubCommandBuildsWorkflowRequest verifies CLI parsing reaches the deep destination without reproducing upload policy.
+func TestUploadGitHubCommandBuildsWorkflowRequest(t *testing.T) {
 	tmp := t.TempDir()
 	scan := rescue.Scan{
 		Repos: []rescue.Repo{{FullName: "alice/project", CloneURL: "https://git.example/alice/project.git"}},
@@ -136,51 +145,67 @@ func TestUploadGitHubCommandUsesGitHubTokenAndOwner(t *testing.T) {
 		t.Fatalf("creating mirror dir: %v", err)
 	}
 
+	destination := &recordingGitHubDestination{}
 	var out bytes.Buffer
-	err := Run(context.Background(), []string{"upload", "github", "--owner", "ghostbladexyz", "--data-dir", tmp}, Env{
-		GitHubToken:      "gh-token",
-		GitHubClient:     &recordingGitHub{},
-		CommandRunner:    &recordingRunner{},
-		MetadataExporter: &recordingExporter{},
-		Now: func() time.Time {
-			return time.Date(2026, 5, 9, 0, 0, 0, 0, time.UTC)
-		},
+	err := Run(context.Background(), []string{"upload", "github", "--owner", "ghostbladexyz", "--replace-existing-refs", "--data-dir", tmp}, Env{
+		GitHubToken: "gh-token",
+		GitHub:      destination,
 	}, &out)
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
 
-	report, err := os.ReadFile(filepath.Join(tmp, "upload-github.json"))
-	if err != nil {
-		t.Fatalf("reading report: %v", err)
-	}
-	if !bytes.Contains(report, []byte(`"success": 1`)) {
-		t.Fatalf("report = %s, want success 1", report)
+	if len(destination.uploads) != 1 || destination.uploads[0].Owner != "ghostbladexyz" || destination.uploads[0].Existing != github.ReplaceExistingRefs || destination.uploads[0].Workspace == nil {
+		t.Fatalf("upload requests = %#v, want one replacement workflow", destination.uploads)
 	}
 }
 
-func TestDeleteGitHubCommandDeletesMultipleRepositories(t *testing.T) {
-	gh := &recordingGitHub{}
+// TestUploadGitHubCommandKeepsDeprecatedForceAlias verifies compatibility maps the old flag to the explicit replacement policy.
+func TestUploadGitHubCommandKeepsDeprecatedForceAlias(t *testing.T) {
+	destination := &recordingGitHubDestination{}
 	var out bytes.Buffer
-	err := Run(context.Background(), []string{"delete", "github", "--owner", "ghostbladexyz", "--delete-repo", "alice/project", "bob-tool"}, Env{
-		GitHubToken:  "gh-token",
-		GitHubClient: gh,
+	err := Run(context.Background(), []string{"upload", "github", "--owner", "alice", "--force-existing", "--data-dir", t.TempDir()}, Env{
+		GitHubToken: "token",
+		GitHub:      destination,
+	}, &out)
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if len(destination.uploads) != 1 || destination.uploads[0].Existing != github.ReplaceExistingRefs || !strings.Contains(out.String(), "deprecated") {
+		t.Fatalf("force alias request/output = %#v/%q", destination.uploads, out.String())
+	}
+}
+
+// TestDeleteGitHubCommandPassesConfirmedExactNames verifies CLI confirmation does not transform destination names.
+func TestDeleteGitHubCommandPassesConfirmedExactNames(t *testing.T) {
+	destination := &recordingGitHubDestination{}
+	var out bytes.Buffer
+	err := Run(context.Background(), []string{"delete", "github", "--owner", "ghostbladexyz", "--confirm-delete", "ghostbladexyz", "alice-project", "bob-tool"}, Env{
+		GitHubToken: "gh-token",
+		GitHub:      destination,
 	}, &out)
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
 
-	want := []string{"ghostbladexyz/alice-project", "ghostbladexyz/bob-tool"}
-	if len(gh.deleted) != len(want) {
-		t.Fatalf("deleted repos = %#v, want %#v", gh.deleted, want)
-	}
-	for i := range want {
-		if gh.deleted[i] != want[i] {
-			t.Fatalf("deleted repos = %#v, want %#v", gh.deleted, want)
-		}
+	if len(destination.deletes) != 1 || destination.deletes[0].Owner != "ghostbladexyz" || !reflect.DeepEqual(destination.deletes[0].Repositories, []string{"alice-project", "bob-tool"}) {
+		t.Fatalf("delete requests = %#v", destination.deletes)
 	}
 }
 
+// TestDeleteGitHubCommandRequiresMatchingConfirmation verifies irreversible requests never reach the destination on a typo.
+func TestDeleteGitHubCommandRequiresMatchingConfirmation(t *testing.T) {
+	destination := &recordingGitHubDestination{}
+	err := Run(context.Background(), []string{"delete", "github", "--owner", "alice", "--confirm-delete", "Alice", "project"}, Env{
+		GitHubToken: "token",
+		GitHub:      destination,
+	}, io.Discard)
+	if err == nil || len(destination.deletes) != 0 {
+		t.Fatalf("Run error/deletes = %v/%#v, want confirmation failure before mutation", err, destination.deletes)
+	}
+}
+
+// writeJSON emits deterministic HTTP fixtures for CLI integration tests.
 func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")
@@ -189,43 +214,43 @@ func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 	}
 }
 
-type recordingRunner struct{}
+type recordingMirrors struct{}
 
-func (recordingRunner) Run(ctx context.Context, name string, args ...string) error {
+// Clone creates the requested artifact because CLI tests verify orchestration rather than Git behavior.
+func (recordingMirrors) Clone(ctx context.Context, source gitmirror.Remote, destination string) error {
+	return os.MkdirAll(destination, 0o700)
+}
+
+// Push accepts a validated workflow request because transport behavior is covered by gitmirror tests.
+func (recordingMirrors) Push(ctx context.Context, mirrorPath string, destination gitmirror.Remote) error {
 	return nil
 }
 
-type recordingExporter struct{}
+type recordingMetadataSource struct{}
 
-func (recordingExporter) ExportMetadata(ctx context.Context, repo rescue.Repo, metadataDir string) error {
-	return nil
+// CaptureMetadata returns a complete archive because CLI tests exercise orchestration rather than remote capture details.
+func (recordingMetadataSource) CaptureMetadata(ctx context.Context, repo rescue.Repo) (rescue.RepositoryMetadata, error) {
+	return rescue.RepositoryMetadata{
+		Repository: json.RawMessage(`{"full_name":"` + repo.FullName + `"}`),
+		Issues:     []json.RawMessage{},
+		Releases:   []json.RawMessage{},
+		Labels:     []json.RawMessage{},
+	}, nil
 }
 
-type recordingGitHub struct {
-	repos   map[string]bool
-	deleted []string
+type recordingGitHubDestination struct {
+	uploads []github.UploadRequest
+	deletes []github.DeleteRequest
 }
 
-func (g *recordingGitHub) RepositoryExists(ctx context.Context, owner, name string) (bool, error) {
-	return g.repos[owner+"/"+name], nil
+// Upload records the workflow-level request because GitHub policy is tested inside its owning module.
+func (d *recordingGitHubDestination) Upload(ctx context.Context, request github.UploadRequest) (github.UploadReport, error) {
+	d.uploads = append(d.uploads, request)
+	return github.UploadReport{}, nil
 }
 
-func (g *recordingGitHub) CreateRepository(ctx context.Context, owner, name string, private bool) error {
-	if !private {
-		return nil
-	}
-	if g.repos == nil {
-		g.repos = map[string]bool{}
-	}
-	g.repos[owner+"/"+name] = true
-	return nil
-}
-
-func (g *recordingGitHub) HasRefs(ctx context.Context, owner, name string) (bool, error) {
-	return false, nil
-}
-
-func (g *recordingGitHub) DeleteRepository(ctx context.Context, owner, name string) error {
-	g.deleted = append(g.deleted, owner+"/"+name)
-	return nil
+// Delete records exact names after CLI confirmation while deletion behavior remains tested inside the GitHub module.
+func (d *recordingGitHubDestination) Delete(ctx context.Context, request github.DeleteRequest) (github.DeleteReport, error) {
+	d.deletes = append(d.deletes, request)
+	return github.DeleteReport{}, nil
 }
