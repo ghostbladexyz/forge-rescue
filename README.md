@@ -169,12 +169,13 @@ export GITHUB_TOKEN="your-github-token"
 4. Open `Personal access tokens`.
 5. Open `Tokens (classic)`.
 6. Create a new classic token.
-7. Select both scopes:
+7. Select the required scopes:
    - `repo`
    - `delete_repo`
+   - `read:org` when uploading to or deleting from an organization
 8. Copy the token immediately and set it as `GITHUB_TOKEN`.
 
-**Delete this GitHub token after you finish** rescuing, uploading, and deleting repositories. A classic token with `repo` and `delete_repo` can create, modify, and delete repositories in your account.
+**Delete this GitHub token after you finish** rescuing, uploading, and deleting repositories. A classic token with `repo` and `delete_repo` can create, modify, and delete repositories in your account; `read:org` lets forge-rescue validate an organization before making any changes.
 
 GitHub repositories are created as private by default. A rescued Gitea repository named `owner/repo` is uploaded to a GitHub repository named `owner-repo`.
 
@@ -240,7 +241,7 @@ An active repository can still be **high risk** if it was created more than a ye
 
 ## Notes
 
-**`rescue`:** shells out to the real `git` binary and runs `git clone --mirror`. Clones are validated as bare repositories before they are moved into their final workspace path, so an interrupted clone is cleaned up instead of being treated as rescued. Repository metadata is fetched completely before it replaces the previous capture, so a failed Gitea request leaves the last complete metadata archive untouched and the rescue resumable. For private repositories, your local Git credential setup must be able to clone from the Gitea instance.
+**`rescue`:** shells out to the real `git` binary and runs `git clone --mirror`. Clones are validated as bare repositories before they are moved into their final workspace path, so an interrupted clone is cleaned up instead of being treated as rescued. Repository metadata is fetched completely before a two-rename directory swap begins. If the process stops between those renames, the next workspace open or read restores the previous complete capture; once the new capture reaches its canonical path, failure to remove the obsolete backup does not change the completed outcome. For private repositories, your local Git credential setup must be able to clone from the Gitea instance.
 
 **`upload github`:** validates each local mirror before shelling out to `git push --mirror`. The GitHub token is supplied through a temporary non-interactive credential environment; it is not placed in the remote URL or Git process arguments. If a GitHub repository already exists and has refs, it is skipped by default to avoid overwriting or deleting existing branches and tags. Use `--replace-existing-refs` only when you intentionally want the local mirror to replace every GitHub ref. The older `--force-existing` spelling remains as a deprecated alias for one release.
 

@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - Keep GitHub credentials out of Git URLs, process arguments, reports, and command errors.
-- Validate Git mirrors and atomically replace workspace records and complete metadata captures.
+- Validate Git mirrors and use recoverable metadata directory swaps that preserve a complete capture across interruption and cleanup failure.
 
 ### Documentation
 
