@@ -1,8 +1,10 @@
 # forge-rescue
 
-[![CI](https://github.com/ghostbladexyz/forge-rescue/actions/workflows/ci.yml/badge.svg)](https://github.com/ghostbladexyz/forge-rescue/actions/workflows/ci.yml)
-[![Latest tag](https://img.shields.io/github/v/tag/ghostbladexyz/forge-rescue)](https://github.com/ghostbladexyz/forge-rescue/tags)
+[![CI](https://github.com/ghostbladexyz/forge-rescue/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ghostbladexyz/forge-rescue/actions/workflows/ci.yml)
+[![Security](https://github.com/ghostbladexyz/forge-rescue/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/ghostbladexyz/forge-rescue/actions/workflows/security.yml)
+[![Latest tag](https://img.shields.io/github/v/tag/ghostbladexyz/forge-rescue?sort=semver)](https://github.com/ghostbladexyz/forge-rescue/tags)
 [![Go version](https://img.shields.io/github/go-mod/go-version/ghostbladexyz/forge-rescue?logo=go)](go.mod)
+[![Go Report Card](https://goreportcard.com/badge/github.com/ghostbladexyz/forge-rescue)](https://goreportcard.com/report/github.com/ghostbladexyz/forge-rescue)
 
 `forge-rescue` is a small CLI for evacuating repositories from a Gitea instance before *age-based deletion*.
 
@@ -23,6 +25,13 @@
 - A GitHub classic token for uploading or deleting GitHub repositories.
 
 ## Install
+
+### From a release
+
+Download the archive for your operating system and architecture from the
+[latest tag](https://github.com/ghostbladexyz/forge-rescue/tags). Each `v*`
+tag is built for Linux, macOS, and Windows on `amd64` and `arm64`, with a
+SHA-256 checksum file.
 
 ### From Go
 
@@ -262,8 +271,12 @@ Run `rescue` before `upload`. Upload only pushes repositories that exist in `for
 
 ```bash
 go test ./...
+go test -race -covermode=atomic -coverprofile=coverage.out ./...
 go vet ./...
 go build .
 ```
 
-CI runs these checks, formatting verification, and race-enabled tests with both Go 1.22 and the current stable Go release.
+CI runs formatting verification, vet, race-enabled tests, coverage, and builds
+with both Go 1.22 and the current stable Go release. Tags matching `v*` publish
+cross-platform release archives through [GoReleaser](.goreleaser.yaml), then
+GitHub attests the published checksums.

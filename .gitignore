@@ -3,3 +3,4 @@ forge-rescue
 forge-rescue-data/
 *.test
 coverage.out
+dist/
